@@ -1,4 +1,5 @@
 use crate::blue_light::BlueLightFilter;
+use crate::config::{Settings, Store};
 use cosmic::app::{Core, Task};
 use cosmic::iced::core::window;
 use cosmic::iced::window::Id;
@@ -13,8 +14,10 @@ pub struct App {
     core: Core,
     popup: Option<Id>,
     value: f32,
+    dim: f32,
     filter: BlueLightFilter,
     status: String,
+    config: Store,
 }
 
 #[derive(Debug, Clone)]
@@ -22,6 +25,8 @@ pub enum Message {
     PopupClosed(Id),
     Surface(cosmic::surface::Action),
     ValueChanged(f32),
+    DimChanged(f32),
+    SlidersReleased,
 }
 
 impl cosmic::Application for App {
@@ -40,13 +45,21 @@ impl cosmic::Application for App {
     }
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Self::Message>) {
-        let app = App {
+        let config = Store::new(Self::APP_ID);
+        let settings = config.load();
+
+        let mut app = App {
             core,
             popup: None,
-            value: 0.0,
+            value: settings.strength,
+            dim: settings.dim,
             filter: BlueLightFilter::default(),
             status: "Off".to_string(),
+            config,
         };
+
+        // Restore the saved filter straight away, so it is already on at login.
+        app.refresh_filter();
 
         (app, Task::none())
     }
@@ -69,10 +82,19 @@ impl cosmic::Application for App {
             }
             Message::ValueChanged(value) => {
                 self.value = value;
-                self.status = match self.filter.set_strength(self.value) {
-                    Ok(status) => status.to_string(),
-                    Err(err) => err.to_string(),
-                };
+                self.refresh_filter();
+            }
+            Message::DimChanged(dim) => {
+                self.dim = dim;
+                self.refresh_filter();
+            }
+            // Persist on release rather than on every drag tick, to keep a drag
+            // from turning into a burst of config writes.
+            Message::SlidersReleased => {
+                self.config.store(Settings {
+                    strength: self.value,
+                    dim: self.dim,
+                });
             }
         }
         Task::none()
@@ -135,14 +157,27 @@ impl cosmic::Application for App {
 }
 
 impl App {
+    fn refresh_filter(&mut self) {
+        self.status = match self.filter.set_strength(self.value, self.dim) {
+            Ok(status) => status.to_string(),
+            Err(err) => err.to_string(),
+        };
+    }
+
     fn popup_view(&self) -> Element<'_, Message> {
-        let slider = widget::slider(0.0..=100.0, self.value, Message::ValueChanged);
+        let slider = widget::slider(0.0..=100.0, self.value, Message::ValueChanged)
+            .on_release(Message::SlidersReleased);
         let space_s = cosmic::theme::spacing().space_s;
         let label = widget::text(format!("Blue filter: {:.0}%", self.value));
+        let dim_slider = widget::slider(0.0..=90.0, self.dim, Message::DimChanged)
+            .on_release(Message::SlidersReleased);
+        let dim_label = widget::text(format!("Dim: {:.0}%", self.dim));
         let status = widget::text(&self.status);
-        let content = widget::column::with_capacity(3)
+        let content = widget::column::with_capacity(5)
             .push(slider)
             .push(label)
+            .push(dim_slider)
+            .push(dim_label)
             .push(status)
             .width(Length::Fill)
             .align_x(Alignment::Center)

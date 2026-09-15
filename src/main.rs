@@ -4,6 +4,8 @@ mod app;
 
 mod blue_light;
 
+mod config;
+
 mod i18n;
 
 fn main() -> cosmic::iced::Result {
