@@ -1,6 +1,72 @@
 # Cosmic Ext Redeye
 
-A nightlight overlay for the COSMIC Desktop Environment
+A night light applet for the COSMIC desktop, driving a real per-channel gamma ramp.
+
+Warmth and dimming are applied as `out = screen * gain` through
+`zwlr_gamma_control_unstable_v1`, so **black stays black**. An earlier version of this
+applet tinted with a layer-shell overlay; that can only ever do
+`out = tint + (1 - alpha) * screen`, where the slope is one scalar shared by all three
+channels, so it could introduce colour only by lifting blacks. That is the washed-out
+haze, and it is why the backend was replaced rather than tuned.
+
+## Features
+
+- Day and night presets, fading smoothly as the sun crosses from +3° to −6° — about an
+  hour, longer near the solstices. The window matches gammastep and redshift.
+- Dragging any slider drops out of the schedule and applies the pair you are dragging, so
+  you can see a night setting at midday instead of adjusting it blind. The **Follow the
+  sun** toggle puts it back, resuming wherever the sun currently is (expect a jump if you
+  do that at midnight — that is the schedule, not a glitch).
+- Scroll the panel icon to nudge warmth without opening the popup. Like a drag, this takes
+  over from the schedule; the tooltip tells you which mode you are in.
+
+## Requirements
+
+**This applet needs a compositor that implements `zwlr_gamma_control_manager_v1`.** Stock
+`cosmic-comp` does not. Upstream has declined the protocol twice, deferring it to a wider
+colour-management story, so this is not a matter of waiting for a release.
+
+Check with:
+
+```sh
+wayland-info | grep zwlr_gamma_control_manager_v1
+```
+
+If it is absent the applet will say so in its popup and do nothing else. Getting it
+present means running a patched `cosmic-comp` carrying
+[PR #2417](https://github.com/pop-os/cosmic-comp/pull/2417). If you build one, pin it, or
+the next distro upgrade will silently replace it and the applet will go inert:
+
+```sh
+# /etc/dnf/dnf.conf, under [main]
+excludepkgs=cosmic-comp
+```
+
+Gamma control is **exclusive per output**, so gammastep, wlsunset or redshift cannot run
+alongside this. Whichever binds second is refused — gammastep words that refusal
+misleadingly as "Zero outputs support gamma adjustment".
+
+## Configuration
+
+Slider positions and presets are stored per key under
+`~/.config/cosmic/io.github.big-ol-pants.CosmicExtRedeye/v1/`.
+
+Location has no UI. Set it by editing two files there, which default to London:
+
+```sh
+echo 51.5074 > ~/.config/cosmic/io.github.big-ol-pants.CosmicExtRedeye/v1/latitude
+echo -- -0.1278 > ~/.config/cosmic/io.github.big-ol-pants.CosmicExtRedeye/v1/longitude
+```
+
+Latitude is north-positive, longitude **east**-positive. They are read at startup only, so
+restart the applet after changing them — the applet never writes them back, so an edit
+made while it is running will not be overwritten.
+
+Diagnostics go to the panel's journal, which inside COSMIC is the only place to see them:
+
+```sh
+journalctl --user -f | grep redeye:
+```
 
 ## Installation
 
