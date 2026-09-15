@@ -36,8 +36,8 @@ impl BlueLightFilter {
         strength_percent: f32,
         dim_percent: f32,
     ) -> Result<FilterStatus, FilterError> {
-        let strength = (strength_percent / 100.0).clamp(0.0, 1.0);
-        let dim = (dim_percent / 100.0).clamp(0.0, MAX_DIM);
+        let strength = sanitise(strength_percent, 1.0);
+        let dim = sanitise(dim_percent, MAX_DIM);
 
         if strength <= f32::EPSILON && dim <= f32::EPSILON {
             self.clear();
@@ -156,6 +156,32 @@ impl From<std::io::Error> for FilterError {
     fn from(err: std::io::Error) -> Self {
         Self::Wayland(err.to_string())
     }
+}
+
+/// Turn a slider percentage into a clamped 0..=max fraction, refusing anything
+/// non-finite.
+///
+/// This guard is load-bearing, not defensive tidiness. `NaN` fails every
+/// comparison, so `strength <= f32::EPSILON` is false for it and the "nothing
+/// to do, switch the filter off" branch is skipped; `NaN.clamp(..)` is still
+/// `NaN`; and `NaN as u16` is a *saturating* cast that yields 0. A single
+/// non-finite value would therefore write an all-zero ramp to every channel of
+/// every output -- a black screen, re-asserted every few seconds, with no
+/// visible UI left to undo it. "We do not know" has to mean "no filter".
+fn sanitise(percent: f32, max: f32) -> f32 {
+    if percent.is_finite() {
+        (percent / 100.0).clamp(0.0, max)
+    } else {
+        0.0
+    }
+}
+
+/// The colour temperature a slider position corresponds to, so the UI can label
+/// what it is actually doing. Takes percent, like `set_strength`, so nothing
+/// outside this module needs to know about the 0..=1 domain used internally.
+#[must_use]
+pub fn temperature_for_percent(strength_percent: f32) -> f32 {
+    temperature_for_strength(sanitise(strength_percent, 1.0))
 }
 
 fn temperature_for_strength(strength: f32) -> f32 {
@@ -541,4 +567,46 @@ fn ramp_bytes(size: u32, gains: [f32; 3], brightness: f32) -> Vec<u8> {
     }
 
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn non_finite_input_cannot_reach_the_ramp() {
+        // The failure this prevents is a black screen, so assert the numbers
+        // rather than trusting the clamp.
+        assert_eq!(sanitise(f32::NAN, 1.0), 0.0);
+        assert_eq!(sanitise(f32::INFINITY, 1.0), 0.0);
+        assert_eq!(sanitise(f32::NEG_INFINITY, 1.0), 0.0);
+        assert_eq!(sanitise(150.0, 1.0), 1.0);
+        assert_eq!(sanitise(-10.0, 1.0), 0.0);
+        assert_eq!(sanitise(50.0, 1.0), 0.5);
+        assert_eq!(sanitise(100.0, MAX_DIM), MAX_DIM);
+    }
+
+    #[test]
+    fn a_nan_ramp_would_have_been_all_zero() {
+        // Documents why the guard exists: this is what the cast does.
+        assert_eq!(f64::NAN.round().clamp(0.0, 65535.0) as u16, 0);
+    }
+
+    #[test]
+    fn neutral_is_identity_and_warmest_is_warm() {
+        assert!((temperature_for_percent(0.0) - 6500.0).abs() < 0.5);
+        assert!((temperature_for_percent(100.0) - 2400.0).abs() < 0.5);
+        let gains = channel_gains(6500.0);
+        assert!((gains[0] - 1.0).abs() < 1e-6 && (gains[1] - 1.0).abs() < 1e-6);
+        let warm = channel_gains(3000.0);
+        assert!(warm[0] > warm[1] && warm[1] > warm[2], "red > green > blue at 3000 K");
+    }
+
+    #[test]
+    fn ramp_is_exactly_three_channels_of_u16_with_black_at_zero() {
+        let bytes = ramp_bytes(1024, [1.0, 0.8, 0.6], 1.0);
+        assert_eq!(bytes.len(), 3 * 1024 * 2, "compositor read_exacts this length");
+        assert_eq!(&bytes[0..2], &0u16.to_ne_bytes(), "black must stay black");
+    }
 }

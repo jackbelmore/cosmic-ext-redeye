@@ -5,6 +5,7 @@ mod app;
 mod blue_light;
 
 mod config;
+mod solar;
 
 mod i18n;
 
