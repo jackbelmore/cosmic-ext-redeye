@@ -3,12 +3,19 @@ use crate::config::{Settings, Store};
 use cosmic::app::{Core, Task};
 use cosmic::iced::core::window;
 use cosmic::iced::window::Id;
-use cosmic::iced::{Alignment, Length, Rectangle};
+use cosmic::iced::{Alignment, Length, Rectangle, Subscription};
 use cosmic::prelude::*;
 use cosmic::surface::action::{app_popup, destroy_popup};
 use cosmic::widget::{self};
 
 const APPLET_ICON: &[u8] = include_bytes!("../resources/icons/hicolor/scalable/apps/Redeye.svg");
+
+/// How often to re-assert the ramp. Gamma lives on the compositor side, so
+/// things can change without the user touching anything: a display is plugged
+/// in, or the compositor hands gamma control to someone else. The filter tracks
+/// what it last sent per output, so a tick with nothing to do is only a socket
+/// poll and writes nothing.
+const REASSERT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct App {
     core: Core,
@@ -29,6 +36,7 @@ pub enum Message {
     ValueChanged(f32),
     DimChanged(f32),
     SlidersReleased,
+    Reassert,
 }
 
 impl cosmic::Application for App {
@@ -93,6 +101,14 @@ impl cosmic::Application for App {
             }
             // Persist on release rather than on every drag tick, to keep a drag
             // from turning into a burst of config writes.
+            // Re-apply against the compositor's current reality rather than our
+            // own last slider position, which is what the unchanged-value guard
+            // in refresh_filter() compares. A new display, or gamma control
+            // coming back to us, shows up here.
+            Message::Reassert => {
+                self.applied = None;
+                self.refresh_filter();
+            }
             Message::SlidersReleased => {
                 self.config.store(Settings {
                     strength: self.value,
@@ -152,6 +168,10 @@ impl cosmic::Application for App {
 
     fn view_window(&self, _id: Id) -> Element<'_, Self::Message> {
         self.popup_view()
+    }
+
+    fn subscription(&self) -> Subscription<Self::Message> {
+        cosmic::iced::time::every(REASSERT_INTERVAL).map(|_| Message::Reassert)
     }
 
     fn style(&self) -> Option<cosmic::iced::theme::Style> {
