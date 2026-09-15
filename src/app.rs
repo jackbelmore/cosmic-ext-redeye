@@ -16,6 +16,8 @@ pub struct App {
     value: f32,
     dim: f32,
     filter: BlueLightFilter,
+    /// The slider positions the filter was last successfully set to.
+    applied: Option<(f32, f32)>,
     status: String,
     config: Store,
 }
@@ -54,6 +56,7 @@ impl cosmic::Application for App {
             value: settings.strength,
             dim: settings.dim,
             filter: BlueLightFilter::default(),
+            applied: None,
             status: "Off".to_string(),
             config,
         };
@@ -158,10 +161,31 @@ impl cosmic::Application for App {
 
 impl App {
     fn refresh_filter(&mut self) {
-        self.status = match self.filter.set_strength(self.value, self.dim) {
-            Ok(status) => status.to_string(),
-            Err(err) => err.to_string(),
+        // A drag can emit the same value several times over; skip the work when
+        // nothing moved. Failures deliberately do not count as applied, so the
+        // filter keeps retrying and recovers on its own once whatever was
+        // holding gamma control lets go.
+        if self.applied == Some((self.value, self.dim)) {
+            return;
+        }
+
+        let status = match self.filter.set_strength(self.value, self.dim) {
+            Ok(status) => {
+                self.applied = Some((self.value, self.dim));
+                status.to_string()
+            }
+            Err(err) => {
+                self.applied = None;
+                err.to_string()
+            }
         };
+
+        // Inside the panel this is the only diagnostic surface there is, so log
+        // transitions. Only on change, so a drag stays quiet.
+        if status != self.status {
+            eprintln!("redeye: {status}");
+        }
+        self.status = status;
     }
 
     fn popup_view(&self) -> Element<'_, Message> {

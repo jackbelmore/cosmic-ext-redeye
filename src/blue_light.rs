@@ -1,18 +1,33 @@
 use std::error::Error;
 use std::fmt;
-use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
+use std::time::{Duration, Instant};
+
+use wayland_client::backend::WaylandError;
+use wayland_client::protocol::{wl_output::WlOutput, wl_registry};
+use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle, delegate_noop};
+use wayland_protocols_wlr::gamma_control::v1::client::{
+    zwlr_gamma_control_manager_v1::ZwlrGammaControlManagerV1,
+    zwlr_gamma_control_v1::{self, ZwlrGammaControlV1},
+};
 
 const NEUTRAL_TEMPERATURE_K: f32 = 6500.0;
 const WARMEST_TEMPERATURE_K: f32 = 2400.0;
-const OVERLAY_BACKEND_NAME: &str = "Wayland overlay";
-/// Never let the overlay go fully opaque; the screen must stay usable.
+const GAMMA_BACKEND_NAME: &str = "Gamma";
+/// Dim is a true per-channel multiply now, so this is a brightness floor of
+/// 0.10 rather than an opacity cap. The same floor gammastep uses.
 const MAX_DIM: f32 = 0.9;
+/// How long to wait before retrying something the compositor refused. Without
+/// this, a slider drag would retry roughly sixty times a second.
+const RETRY_BACKOFF: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Default)]
 pub struct BlueLightFilter {
-    backend: Option<WaylandOverlayFilter>,
+    backend: Option<WaylandGammaFilter>,
+    /// A failed connection, remembered briefly so that a drag cannot hammer a
+    /// compositor that has no gamma control.
+    connect_failure: Option<(Instant, FilterError)>,
 }
 
 impl BlueLightFilter {
@@ -30,26 +45,44 @@ impl BlueLightFilter {
         }
 
         let temperature = temperature_for_strength(strength);
-        let color = overlay_color(channel_gains(temperature), dim);
+        let gains = channel_gains(temperature);
+        let brightness = 1.0 - dim;
 
         if self.backend.is_none() {
-            self.backend = Some(WaylandOverlayFilter::new()?);
+            if let Some((at, err)) = &self.connect_failure
+                && at.elapsed() < RETRY_BACKOFF
+            {
+                return Err(err.clone());
+            }
+            match WaylandGammaFilter::new() {
+                Ok(backend) => {
+                    self.connect_failure = None;
+                    self.backend = Some(backend);
+                }
+                Err(err) => {
+                    self.connect_failure = Some((Instant::now(), err.clone()));
+                    return Err(err);
+                }
+            }
         }
 
         let backend = self.backend.as_mut().expect("backend was just initialized");
-        backend.apply(color)?;
+        let (applied, total) = backend.apply(temperature, gains, brightness)?;
 
         Ok(FilterStatus::Active {
-            backend: OVERLAY_BACKEND_NAME,
+            backend: GAMMA_BACKEND_NAME,
             temperature_kelvin: temperature.round() as u16,
             dim_percent: (dim * 100.0).round() as u8,
+            applied,
+            total,
         })
     }
 
+    /// Dropping the backend destroys every gamma control, which is what restores
+    /// the original ramps and releases the outputs for other clients.
     fn clear(&mut self) {
-        if let Some(mut backend) = self.backend.take() {
-            backend.clear();
-        }
+        self.backend = None;
+        self.connect_failure = None;
     }
 }
 
@@ -59,13 +92,15 @@ impl Drop for BlueLightFilter {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterStatus {
     Inactive,
     Active {
         backend: &'static str,
         temperature_kelvin: u16,
         dim_percent: u8,
+        applied: usize,
+        total: usize,
     },
 }
 
@@ -77,23 +112,41 @@ impl fmt::Display for FilterStatus {
                 backend,
                 temperature_kelvin,
                 dim_percent,
-            } => write!(f, "{backend}: {temperature_kelvin} K, -{dim_percent}%"),
+                applied,
+                total,
+            } => {
+                write!(f, "{backend}: {temperature_kelvin} K, -{dim_percent}%")?;
+                if applied != total {
+                    write!(f, " ({applied}/{total} displays)")?;
+                }
+                Ok(())
+            }
         }
     }
 }
 
-#[derive(Debug)]
-pub struct FilterError(String);
-
-impl FilterError {
-    fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
-    }
+#[derive(Debug, Clone)]
+pub enum FilterError {
+    /// The compositor never advertised `zwlr_gamma_control_manager_v1`.
+    NoProtocol,
+    /// It did, but every output refused. The protocol cannot tell us why: another
+    /// client holding the output, an output with no gamma table, and a compositor
+    /// running on a non-KMS backend all look identical from here.
+    Unavailable,
+    NoOutputs,
+    Wayland(String),
 }
 
 impl fmt::Display for FilterError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            FilterError::NoProtocol => f.write_str("No gamma control in this compositor"),
+            FilterError::Unavailable => {
+                f.write_str("Gamma control unavailable - another app (gammastep?) may hold it")
+            }
+            FilterError::NoOutputs => f.write_str("No displays reported"),
+            FilterError::Wayland(message) => f.write_str(message),
+        }
     }
 }
 
@@ -101,7 +154,7 @@ impl Error for FilterError {}
 
 impl From<std::io::Error> for FilterError {
     fn from(err: std::io::Error) -> Self {
-        Self::new(err.to_string())
+        Self::Wayland(err.to_string())
     }
 }
 
@@ -154,36 +207,42 @@ fn channel_gains(temperature_kelvin: f32) -> [f32; 3] {
 }
 
 #[derive(Debug)]
-struct WaylandOverlayFilter {
-    _connection: wayland_client::Connection,
-    event_queue: wayland_client::EventQueue<OverlayState>,
-    state: OverlayState,
+struct WaylandGammaFilter {
+    /// This is the applet's *second* Wayland connection, separate from the one
+    /// libcosmic holds. It works because libcosmic connects first during
+    /// `cosmic::applet::run` and consumes `WAYLAND_SOCKET` if it was set, leaving
+    /// `WAYLAND_DISPLAY` for us. Do not move this construction any earlier.
+    _connection: Connection,
+    event_queue: EventQueue<GammaState>,
+    state: GammaState,
 }
 
-impl WaylandOverlayFilter {
+impl WaylandGammaFilter {
     fn new() -> Result<Self, FilterError> {
-        use wayland_client::Connection;
-
         let connection = Connection::connect_to_env()
-            .map_err(|err| FilterError::new(format!("Could not connect to Wayland: {err}")))?;
+            .map_err(|err| FilterError::Wayland(format!("Could not connect to Wayland: {err}")))?;
         let mut event_queue = connection.new_event_queue();
         let queue_handle = event_queue.handle();
-        let display = connection.display();
-        let _registry = display.get_registry(&queue_handle, ());
+        connection.display().get_registry(&queue_handle, ());
 
-        let mut state = OverlayState::default();
-        event_queue.roundtrip(&mut state).map_err(|err| {
-            FilterError::new(format!("Could not read Wayland overlay globals: {err}"))
-        })?;
-
-        state.create_surfaces(&queue_handle)?;
+        let mut state = GammaState::default();
         event_queue
             .roundtrip(&mut state)
-            .map_err(|err| FilterError::new(format!("Could not configure overlay: {err}")))?;
+            .map_err(|err| FilterError::Wayland(format!("Could not read Wayland globals: {err}")))?;
 
-        if state.surfaces.iter().all(|surface| !surface.configured) {
-            return Err(FilterError::new("Wayland overlay was not configured"));
+        if state.manager.is_none() {
+            return Err(FilterError::NoProtocol);
         }
+        if state.outputs.is_empty() {
+            return Err(FilterError::NoOutputs);
+        }
+
+        // The second roundtrip is what makes a truthful status possible straight
+        // away: `gamma_size` and `failed` only arrive after one.
+        state.create_missing_controls(&queue_handle);
+        event_queue.roundtrip(&mut state).map_err(|err| {
+            FilterError::Wayland(format!("Could not create gamma controls: {err}"))
+        })?;
 
         Ok(Self {
             _connection: connection,
@@ -192,479 +251,294 @@ impl WaylandOverlayFilter {
         })
     }
 
-    fn apply(&mut self, color: OverlayColor) -> Result<(), FilterError> {
-        self.event_queue
-            .dispatch_pending(&mut self.state)
-            .map_err(|err| FilterError::new(format!("Could not dispatch overlay events: {err}")))?;
-
-        if self
-            .state
-            .surfaces
-            .iter()
-            .any(|surface| !surface.configured && !surface.closed)
-        {
-            self.event_queue
-                .roundtrip(&mut self.state)
-                .map_err(|err| FilterError::new(format!("Could not configure overlay: {err}")))?;
-        }
+    /// Returns how many outputs took the ramp, and how many there are.
+    fn apply(
+        &mut self,
+        temperature: f32,
+        gains: [f32; 3],
+        brightness: f32,
+    ) -> Result<(usize, usize), FilterError> {
+        self.pump()?;
 
         let queue_handle = self.event_queue.handle();
-        self.state.draw(&queue_handle, color)?;
-        self.event_queue
-            .flush()
-            .map_err(|err| FilterError::new(format!("Could not flush overlay update: {err}")))?;
+        if self.state.create_missing_controls(&queue_handle) > 0 {
+            self.event_queue.roundtrip(&mut self.state).map_err(|err| {
+                FilterError::Wayland(format!("Could not create gamma controls: {err}"))
+            })?;
+        }
 
-        Ok(())
+        // Every in-flight `set_gamma` needs its own file: the fd is shared with
+        // the compositor through SCM_RIGHTS, offset and all, and the compositor
+        // reads it when it dispatches the request rather than when we send it.
+        // Rewinding a shared file under a read in progress would give a short
+        // read, which makes the compositor reset the output to identity.
+        let mut in_flight = Vec::new();
+        let mut applied = 0;
+
+        for entry in &mut self.state.outputs {
+            let (Some(control), Some(size)) = (entry.control.as_ref(), entry.ramp_size) else {
+                continue;
+            };
+            applied += 1;
+
+            let key = (size, temperature.to_bits(), brightness.to_bits());
+            if entry.last_ramp == Some(key) {
+                continue;
+            }
+
+            let mut file = tempfile::tempfile()?;
+            file.write_all(&ramp_bytes(size, gains, brightness))?;
+            file.seek(SeekFrom::Start(0))?;
+            control.set_gamma(file.as_fd());
+            entry.last_ramp = Some(key);
+            in_flight.push(file);
+        }
+
+        if !in_flight.is_empty() {
+            self.event_queue.flush().map_err(|err| {
+                FilterError::Wayland(format!("Could not send gamma update: {err}"))
+            })?;
+        }
+        drop(in_flight);
+
+        if applied == 0 {
+            return Err(FilterError::Unavailable);
+        }
+        Ok((applied, self.state.outputs.len()))
     }
 
-    fn clear(&mut self) {
-        for surface in &self.state.surfaces {
-            surface.surface.attach(None, 0, 0);
-            surface.surface.commit();
-            surface.layer_surface.destroy();
+    /// Drain the socket without blocking.
+    ///
+    /// `dispatch_pending` on its own is not enough: it only dispatches what
+    /// something has already read off the socket, and nothing else reads this
+    /// connection. Without an explicit read we would never see `failed`, never
+    /// see an output appear or disappear, and slowly fill the receive buffer.
+    fn pump(&mut self) -> Result<(), FilterError> {
+        self.dispatch_pending()?;
+        if let Some(guard) = self.event_queue.prepare_read() {
+            match guard.read() {
+                Ok(_) => {}
+                // Nothing waiting. Both wayland-backend implementations treat
+                // this as non-fatal and leave the connection usable.
+                Err(WaylandError::Io(err)) if err.kind() == ErrorKind::WouldBlock => {}
+                Err(err) => {
+                    return Err(FilterError::Wayland(format!(
+                        "Could not read Wayland events: {err}"
+                    )));
+                }
+            }
         }
+        self.dispatch_pending()
+    }
+
+    fn dispatch_pending(&mut self) -> Result<(), FilterError> {
+        self.event_queue
+            .dispatch_pending(&mut self.state)
+            .map(|_| ())
+            .map_err(|err| FilterError::Wayland(format!("Could not dispatch Wayland events: {err}")))
+    }
+}
+
+impl Drop for WaylandGammaFilter {
+    fn drop(&mut self) {
+        for entry in &mut self.state.outputs {
+            if let Some(control) = entry.control.take() {
+                control.destroy();
+            }
+        }
+        if let Some((_, manager)) = self.state.manager.take() {
+            manager.destroy();
+        }
+        // These requests are only buffered. The connection is dropped right
+        // after this, and an unflushed buffer is simply discarded.
         let _ = self.event_queue.flush();
     }
 }
 
 #[derive(Debug, Default)]
-struct OverlayState {
-    compositor: Option<wayland_client::protocol::wl_compositor::WlCompositor>,
-    shm: Option<wayland_client::protocol::wl_shm::WlShm>,
-    layer_shell: Option<wayland_layer::zwlr_layer_shell_v1::ZwlrLayerShellV1>,
-    outputs: Vec<wayland_client::protocol::wl_output::WlOutput>,
-    surfaces: Vec<OverlaySurface>,
+struct GammaState {
+    /// Paired with its registry name so that its removal is representable.
+    manager: Option<(u32, ZwlrGammaControlManagerV1)>,
+    outputs: Vec<OutputEntry>,
 }
 
-impl OverlayState {
-    fn create_surfaces(
-        &mut self,
-        queue_handle: &wayland_client::QueueHandle<Self>,
-    ) -> Result<(), FilterError> {
-        let compositor = self
-            .compositor
-            .clone()
-            .ok_or_else(|| FilterError::new("Wayland compositor global is unavailable"))?;
-        let layer_shell = self
-            .layer_shell
-            .clone()
-            .ok_or_else(|| FilterError::new("Wayland layer-shell global is unavailable"))?;
-
-        if self.outputs.is_empty() {
-            return Err(FilterError::new("Wayland did not report any outputs"));
-        }
-
-        for output in self.outputs.clone() {
-            let index = self.surfaces.len();
-            let surface = compositor.create_surface(queue_handle, index);
-            let region = compositor.create_region(queue_handle, ());
-            surface.set_input_region(Some(&region));
-            region.destroy();
-
-            let layer_surface = layer_shell.get_layer_surface(
-                &surface,
-                Some(&output),
-                wayland_layer::zwlr_layer_shell_v1::Layer::Overlay,
-                "cosmic-ext-redeye-blue-light".to_string(),
-                queue_handle,
-                index,
-            );
-            layer_surface.set_anchor(
-                wayland_layer::zwlr_layer_surface_v1::Anchor::Top
-                    | wayland_layer::zwlr_layer_surface_v1::Anchor::Bottom
-                    | wayland_layer::zwlr_layer_surface_v1::Anchor::Left
-                    | wayland_layer::zwlr_layer_surface_v1::Anchor::Right,
-            );
-            layer_surface.set_exclusive_zone(-1);
-            layer_surface.set_size(0, 0);
-
-            self.surfaces.push(OverlaySurface {
-                surface: surface.clone(),
-                layer_surface,
-                width: 1,
-                height: 1,
-                configured: false,
-                closed: false,
-                buffer: None,
-            });
-
-            surface.commit();
-        }
-
-        Ok(())
-    }
-
-    fn draw(
-        &mut self,
-        queue_handle: &wayland_client::QueueHandle<Self>,
-        color: OverlayColor,
-    ) -> Result<(), FilterError> {
-        let shm = self
-            .shm
-            .clone()
-            .ok_or_else(|| FilterError::new("Wayland shared memory global is unavailable"))?;
-
-        for (index, surface) in self.surfaces.iter_mut().enumerate() {
-            if !surface.configured || surface.closed {
-                continue;
-            }
-
-            let buffer = overlay_buffer(
-                &shm,
-                queue_handle,
-                index,
-                surface.width,
-                surface.height,
-                color,
-            )?;
-            surface.surface.attach(Some(&buffer.buffer), 0, 0);
-            surface
-                .surface
-                .damage(0, 0, surface.width as i32, surface.height as i32);
-            surface.surface.commit();
-            surface.buffer = Some(buffer);
-        }
-
-        Ok(())
-    }
-}
-
-#[derive(Debug)]
-struct OverlaySurface {
-    surface: wayland_client::protocol::wl_surface::WlSurface,
-    layer_surface: wayland_layer::zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
-    width: u32,
-    height: u32,
-    configured: bool,
-    closed: bool,
-    buffer: Option<OverlayBuffer>,
-}
-
-#[derive(Debug)]
-struct OverlayBuffer {
-    _file: File,
-    _pool: wayland_client::protocol::wl_shm_pool::WlShmPool,
-    buffer: wayland_client::protocol::wl_buffer::WlBuffer,
-}
-
-mod wayland_layer {
-    pub use wayland_protocols_wlr::layer_shell::v1::client::{
-        zwlr_layer_shell_v1, zwlr_layer_surface_v1,
-    };
-}
-
-impl wayland_client::Dispatch<wayland_client::protocol::wl_registry::WlRegistry, ()>
-    for OverlayState
-{
-    fn event(
-        state: &mut Self,
-        registry: &wayland_client::protocol::wl_registry::WlRegistry,
-        event: wayland_client::protocol::wl_registry::Event,
-        _: &(),
-        _: &wayland_client::Connection,
-        queue_handle: &wayland_client::QueueHandle<OverlayState>,
-    ) {
-        if let wayland_client::protocol::wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        } = event
-        {
-            match interface.as_str() {
-                "wl_compositor" => {
-                    state.compositor = Some(
-                        registry
-                            .bind::<wayland_client::protocol::wl_compositor::WlCompositor, _, _>(
-                                name,
-                                version.min(4),
-                                queue_handle,
-                                (),
-                            ),
-                    );
-                }
-                "wl_shm" => {
-                    state.shm = Some(
-                        registry.bind::<wayland_client::protocol::wl_shm::WlShm, _, _>(
-                            name,
-                            1,
-                            queue_handle,
-                            (),
-                        ),
-                    );
-                }
-                "wl_output" => {
-                    state.outputs.push(
-                        registry.bind::<wayland_client::protocol::wl_output::WlOutput, _, _>(
-                            name,
-                            version.min(4),
-                            queue_handle,
-                            (),
-                        ),
-                    );
-                }
-                "zwlr_layer_shell_v1" => {
-                    state.layer_shell = Some(
-                        registry
-                            .bind::<wayland_layer::zwlr_layer_shell_v1::ZwlrLayerShellV1, _, _>(
-                                name,
-                                version.min(4),
-                                queue_handle,
-                                (),
-                            ),
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-impl wayland_client::Dispatch<wayland_client::protocol::wl_compositor::WlCompositor, ()>
-    for OverlayState
-{
-    fn event(
-        _: &mut Self,
-        _: &wayland_client::protocol::wl_compositor::WlCompositor,
-        _: wayland_client::protocol::wl_compositor::Event,
-        _: &(),
-        _: &wayland_client::Connection,
-        _: &wayland_client::QueueHandle<OverlayState>,
-    ) {
-    }
-}
-
-impl wayland_client::Dispatch<wayland_client::protocol::wl_shm::WlShm, ()> for OverlayState {
-    fn event(
-        _: &mut Self,
-        _: &wayland_client::protocol::wl_shm::WlShm,
-        _: wayland_client::protocol::wl_shm::Event,
-        _: &(),
-        _: &wayland_client::Connection,
-        _: &wayland_client::QueueHandle<OverlayState>,
-    ) {
-    }
-}
-
-impl wayland_client::Dispatch<wayland_client::protocol::wl_output::WlOutput, ()> for OverlayState {
-    fn event(
-        _: &mut Self,
-        _: &wayland_client::protocol::wl_output::WlOutput,
-        _: wayland_client::protocol::wl_output::Event,
-        _: &(),
-        _: &wayland_client::Connection,
-        _: &wayland_client::QueueHandle<OverlayState>,
-    ) {
-    }
-}
-
-impl wayland_client::Dispatch<wayland_client::protocol::wl_surface::WlSurface, usize>
-    for OverlayState
-{
-    fn event(
-        _: &mut Self,
-        _: &wayland_client::protocol::wl_surface::WlSurface,
-        _: wayland_client::protocol::wl_surface::Event,
-        _: &usize,
-        _: &wayland_client::Connection,
-        _: &wayland_client::QueueHandle<OverlayState>,
-    ) {
-    }
-}
-
-impl wayland_client::Dispatch<wayland_client::protocol::wl_region::WlRegion, ()> for OverlayState {
-    fn event(
-        _: &mut Self,
-        _: &wayland_client::protocol::wl_region::WlRegion,
-        _: wayland_client::protocol::wl_region::Event,
-        _: &(),
-        _: &wayland_client::Connection,
-        _: &wayland_client::QueueHandle<OverlayState>,
-    ) {
-    }
-}
-
-impl wayland_client::Dispatch<wayland_client::protocol::wl_shm_pool::WlShmPool, usize>
-    for OverlayState
-{
-    fn event(
-        _: &mut Self,
-        _: &wayland_client::protocol::wl_shm_pool::WlShmPool,
-        _: wayland_client::protocol::wl_shm_pool::Event,
-        _: &usize,
-        _: &wayland_client::Connection,
-        _: &wayland_client::QueueHandle<OverlayState>,
-    ) {
-    }
-}
-
-impl wayland_client::Dispatch<wayland_client::protocol::wl_buffer::WlBuffer, usize>
-    for OverlayState
-{
-    fn event(
-        _: &mut Self,
-        _: &wayland_client::protocol::wl_buffer::WlBuffer,
-        _: wayland_client::protocol::wl_buffer::Event,
-        _: &usize,
-        _: &wayland_client::Connection,
-        _: &wayland_client::QueueHandle<OverlayState>,
-    ) {
-    }
-}
-
-impl wayland_client::Dispatch<wayland_layer::zwlr_layer_shell_v1::ZwlrLayerShellV1, ()>
-    for OverlayState
-{
-    fn event(
-        _: &mut Self,
-        _: &wayland_layer::zwlr_layer_shell_v1::ZwlrLayerShellV1,
-        _: wayland_layer::zwlr_layer_shell_v1::Event,
-        _: &(),
-        _: &wayland_client::Connection,
-        _: &wayland_client::QueueHandle<OverlayState>,
-    ) {
-    }
-}
-
-impl wayland_client::Dispatch<wayland_layer::zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, usize>
-    for OverlayState
-{
-    fn event(
-        state: &mut Self,
-        layer_surface: &wayland_layer::zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
-        event: wayland_layer::zwlr_layer_surface_v1::Event,
-        index: &usize,
-        _: &wayland_client::Connection,
-        _: &wayland_client::QueueHandle<OverlayState>,
-    ) {
-        let Some(surface) = state.surfaces.get_mut(*index) else {
-            return;
+impl GammaState {
+    /// Give every output that lacks one a gamma control, honouring the retry
+    /// backoff. Returns how many were created, since each one owes us a
+    /// `gamma_size` before it can be written to.
+    fn create_missing_controls(&mut self, queue_handle: &QueueHandle<Self>) -> usize {
+        let Some((_, manager)) = self.manager.clone() else {
+            return 0;
         };
 
-        match event {
-            wayland_layer::zwlr_layer_surface_v1::Event::Configure {
-                serial,
-                width,
-                height,
-            } => {
-                layer_surface.ack_configure(serial);
-                surface.width = width.max(1);
-                surface.height = height.max(1);
-                surface.configured = true;
+        let now = Instant::now();
+        let mut created = 0;
+
+        for entry in &mut self.outputs {
+            if entry.control.is_some() || entry.retry_after.is_some_and(|at| now < at) {
+                continue;
             }
-            wayland_layer::zwlr_layer_surface_v1::Event::Closed => {
-                surface.closed = true;
+            entry.control = Some(manager.get_gamma_control(&entry.output, queue_handle, entry.name));
+            entry.ramp_size = None;
+            entry.last_ramp = None;
+            entry.retry_after = None;
+            created += 1;
+        }
+
+        created
+    }
+}
+
+#[derive(Debug)]
+struct OutputEntry {
+    /// The `wl_registry` global name: unique for the compositor's lifetime, and
+    /// exactly what `GlobalRemove` reports. Keying by index into `outputs` would
+    /// alias a different output the moment one is unplugged.
+    name: u32,
+    output: WlOutput,
+    output_version: u32,
+    control: Option<ZwlrGammaControlV1>,
+    /// `Some` once `gamma_size` has arrived; until then the control is unusable.
+    ramp_size: Option<u32>,
+    /// Set when the compositor refuses us, to gate the next attempt.
+    retry_after: Option<Instant>,
+    /// What we last sent, so an unmoved slider costs nothing.
+    last_ramp: Option<(u32, u32, u32)>,
+}
+
+impl Dispatch<wl_registry::WlRegistry, ()> for GammaState {
+    fn event(
+        state: &mut Self,
+        registry: &wl_registry::WlRegistry,
+        event: wl_registry::Event,
+        &(): &(),
+        _: &Connection,
+        queue_handle: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } => match interface.as_str() {
+                "wl_output" => {
+                    let version = version.min(4);
+                    let output = registry.bind::<WlOutput, _, _>(name, version, queue_handle, ());
+                    state.outputs.push(OutputEntry {
+                        name,
+                        output,
+                        output_version: version,
+                        control: None,
+                        ramp_size: None,
+                        retry_after: None,
+                        last_ramp: None,
+                    });
+                }
+                // The protocol is frozen at version 1.
+                "zwlr_gamma_control_manager_v1" => {
+                    let manager =
+                        registry.bind::<ZwlrGammaControlManagerV1, _, _>(name, 1, queue_handle, ());
+                    state.manager = Some((name, manager));
+                }
+                _ => {}
+            },
+            wl_registry::Event::GlobalRemove { name } => {
+                if state.manager.as_ref().is_some_and(|(id, _)| *id == name) {
+                    state.manager = None;
+                }
+                if let Some(index) = state.outputs.iter().position(|entry| entry.name == name) {
+                    let mut entry = state.outputs.remove(index);
+                    // Proxies are not RAII: dropping one sends nothing, and the
+                    // compositor-side resource - and its ramp - would survive.
+                    if let Some(control) = entry.control.take() {
+                        control.destroy();
+                    }
+                    if entry.output_version >= 3 {
+                        entry.output.release();
+                    }
+                }
             }
             _ => {}
         }
     }
 }
 
-/// A premultiplied ARGB pixel for the whole-screen overlay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OverlayColor {
-    alpha: u8,
-    red: u8,
-    green: u8,
-    blue: u8,
-}
+impl Dispatch<ZwlrGammaControlV1, u32> for GammaState {
+    fn event(
+        state: &mut Self,
+        control: &ZwlrGammaControlV1,
+        event: zwlr_gamma_control_v1::Event,
+        name: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(entry) = state.outputs.iter_mut().find(|entry| entry.name == *name) else {
+            control.destroy();
+            return;
+        };
+        // An event for a control we have already replaced or given up on.
+        if entry.control.as_ref() != Some(control) {
+            return;
+        }
 
-/// Builds the best "over" approximation of a per-channel multiply.
-///
-/// A gamma ramp (what GNOME and KDE use) computes `out_c = screen_c * gain_c`:
-/// a different slope per channel. Alpha compositing can only produce
-/// `out_c = tint_c + (1 - alpha) * screen_c`, where the slope `1 - alpha` is one
-/// scalar shared by all three channels and only the intercept `tint_c` varies.
-/// So colour can only be introduced by lifting blacks, which is the haze an
-/// overlay can never fully escape.
-///
-/// Given that, take the slope from the smallest gain (making that channel exact)
-/// and pick each intercept to minimise squared error across the tone range,
-/// which lands at half the gain gap. Fitting the midtones this way halves the
-/// black lift compared with matching white exactly.
-///
-/// Dimming is then a true multiply -- it scales every channel by the same
-/// `keep`, so it composes exactly and costs no accuracy.
-fn overlay_color(gains: [f32; 3], dim: f32) -> OverlayColor {
-    let slope = gains[0].min(gains[1]).min(gains[2]);
-    let keep = (1.0 - dim).clamp(0.0, 1.0);
-
-    let intercept = |gain: f32| ((gain - slope) / 2.0).max(0.0) * keep;
-
-    OverlayColor {
-        alpha: to_u8(1.0 - keep * slope),
-        red: to_u8(intercept(gains[0])),
-        green: to_u8(intercept(gains[1])),
-        blue: to_u8(intercept(gains[2])),
+        match event {
+            zwlr_gamma_control_v1::Event::GammaSize { size } if size > 0 => {
+                entry.ramp_size = Some(size);
+            }
+            // `failed` means the compositor has given up on this output - another
+            // client holds it, it has no gamma table, or programming it failed.
+            // A zero ramp size is just as unusable. Either way the spec wants the
+            // object destroyed.
+            zwlr_gamma_control_v1::Event::GammaSize { .. }
+            | zwlr_gamma_control_v1::Event::Failed => {
+                if let Some(control) = entry.control.take() {
+                    control.destroy();
+                }
+                entry.ramp_size = None;
+                entry.last_ramp = None;
+                entry.retry_after = Some(Instant::now() + RETRY_BACKOFF);
+            }
+            _ => {}
+        }
     }
 }
 
-fn to_u8(value: f32) -> u8 {
-    (value.clamp(0.0, 1.0) * u8::MAX as f32).round() as u8
-}
+// Neither interface sends us anything we act on. `ignore` rather than the plain
+// form, whose body is `unreachable!()`: panicking inside a Wayland event handler
+// is a worse failure mode for a panel applet than dropping a stray event.
+delegate_noop!(GammaState: ignore WlOutput);
+delegate_noop!(GammaState: ignore ZwlrGammaControlManagerV1);
 
-fn overlay_buffer(
-    shm: &wayland_client::protocol::wl_shm::WlShm,
-    queue_handle: &wayland_client::QueueHandle<OverlayState>,
-    index: usize,
-    width: u32,
-    height: u32,
-    color: OverlayColor,
-) -> Result<OverlayBuffer, FilterError> {
-    let stride = width
-        .checked_mul(4)
-        .ok_or_else(|| FilterError::new("Overlay width is too large"))?;
-    let size = stride
-        .checked_mul(height)
-        .ok_or_else(|| FilterError::new("Overlay surface is too large"))?;
-    let size_i32 = i32::try_from(size)
-        .map_err(|_| FilterError::new("Overlay buffer is too large for Wayland shm"))?;
+/// One output's whole gamma table: the R ramp, then G, then B, native-endian
+/// `u16`, exactly `3 * size * 2` bytes.
+///
+/// The compositor reads this with `read_exact` into a `vec![0u16; size * 3]` and
+/// then checks for EOF, so the length has to be exact - a trailing byte is an
+/// error, not slack.
+///
+/// The curve is a plain linear multiply on the encoded value, `i * 65536/size`
+/// scaled by the gain, which is what gammastep writes and what leaves black at
+/// exactly zero. Scaling by `65535/(size-1)` instead would be the same to within
+/// 0.1% at white; this form matches the reference byte for byte.
+// Every cast below is bounded: `i` is less than `size`, and the product is
+// clamped into `u16` range before conversion.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn ramp_bytes(size: u32, gains: [f32; 3], brightness: f32) -> Vec<u8> {
+    let count = size as usize;
+    let step = 65536.0 / f64::from(size);
+    let mut bytes = Vec::with_capacity(count * 3 * 2);
 
-    let mut file = tempfile::tempfile()?;
-    file.set_len(size as u64)?;
-    write_overlay_pixels(&mut file, width, height, color)?;
-    file.seek(SeekFrom::Start(0))?;
-
-    let pool = shm.create_pool(file.as_fd(), size_i32, queue_handle, index);
-    let buffer = pool.create_buffer(
-        0,
-        width as i32,
-        height as i32,
-        stride as i32,
-        wayland_client::protocol::wl_shm::Format::Argb8888,
-        queue_handle,
-        index,
-    );
-
-    Ok(OverlayBuffer {
-        _file: file,
-        _pool: pool,
-        buffer,
-    })
-}
-
-fn write_overlay_pixels(
-    file: &mut File,
-    width: u32,
-    height: u32,
-    color: OverlayColor,
-) -> Result<(), FilterError> {
-    let pixel = u32::from(color.alpha) << 24
-        | u32::from(color.red) << 16
-        | u32::from(color.green) << 8
-        | u32::from(color.blue);
-    let pixel = pixel.to_ne_bytes();
-    let row_len = width as usize * 4;
-    let mut row = Vec::with_capacity(row_len);
-
-    for _ in 0..width {
-        row.extend_from_slice(&pixel);
+    for gain in gains {
+        let scale = f64::from((gain * brightness).clamp(0.0, 1.0));
+        for i in 0..count {
+            let value = (i as f64 * step * scale).round().clamp(0.0, 65535.0) as u16;
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
     }
 
-    for _ in 0..height {
-        file.write_all(&row)?;
-    }
-
-    file.flush()?;
-
-    Ok(())
+    bytes
 }
