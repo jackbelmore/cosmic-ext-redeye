@@ -12,8 +12,10 @@ use wayland_protocols_wlr::gamma_control::v1::client::{
     zwlr_gamma_control_v1::{self, ZwlrGammaControlV1},
 };
 
-const NEUTRAL_TEMPERATURE_K: f32 = 6500.0;
-const WARMEST_TEMPERATURE_K: f32 = 2400.0;
+/// The colour temperature "Warmth" is 0% at, and the upper bound
+/// `config::Settings::sanitised` clamps `warmest_temperature_k` against -- the
+/// two must stay ordered or the slider stops meaning anything.
+pub(crate) const NEUTRAL_TEMPERATURE_K: f32 = 6500.0;
 const GAMMA_BACKEND_NAME: &str = "Gamma";
 /// Dim is a true per-channel multiply now, so this is a brightness floor of
 /// 0.10 rather than an opacity cap. The same floor gammastep uses.
@@ -35,6 +37,7 @@ impl BlueLightFilter {
         &mut self,
         strength_percent: f32,
         dim_percent: f32,
+        warmest_temperature_k: f32,
     ) -> Result<FilterStatus, FilterError> {
         let strength = sanitise(strength_percent, 1.0);
         let dim = sanitise(dim_percent, MAX_DIM);
@@ -44,7 +47,7 @@ impl BlueLightFilter {
             return Ok(FilterStatus::Inactive);
         }
 
-        let temperature = temperature_for_strength(strength);
+        let temperature = temperature_for_strength(strength, warmest_temperature_k);
         let gains = channel_gains(temperature);
         let brightness = 1.0 - dim;
 
@@ -180,12 +183,12 @@ fn sanitise(percent: f32, max: f32) -> f32 {
 /// what it is actually doing. Takes percent, like `set_strength`, so nothing
 /// outside this module needs to know about the 0..=1 domain used internally.
 #[must_use]
-pub fn temperature_for_percent(strength_percent: f32) -> f32 {
-    temperature_for_strength(sanitise(strength_percent, 1.0))
+pub fn temperature_for_percent(strength_percent: f32, warmest_temperature_k: f32) -> f32 {
+    temperature_for_strength(sanitise(strength_percent, 1.0), warmest_temperature_k)
 }
 
-fn temperature_for_strength(strength: f32) -> f32 {
-    NEUTRAL_TEMPERATURE_K - ((NEUTRAL_TEMPERATURE_K - WARMEST_TEMPERATURE_K) * strength)
+fn temperature_for_strength(strength: f32, warmest_temperature_k: f32) -> f32 {
+    NEUTRAL_TEMPERATURE_K - ((NEUTRAL_TEMPERATURE_K - warmest_temperature_k) * strength)
 }
 
 /// Per-channel gains for a blackbody at `temperature_kelvin`, using the Tanner
@@ -595,8 +598,9 @@ mod tests {
 
     #[test]
     fn neutral_is_identity_and_warmest_is_warm() {
-        assert!((temperature_for_percent(0.0) - 6500.0).abs() < 0.5);
-        assert!((temperature_for_percent(100.0) - 2400.0).abs() < 0.5);
+        const WARMEST: f32 = 1000.0;
+        assert!((temperature_for_percent(0.0, WARMEST) - 6500.0).abs() < 0.5);
+        assert!((temperature_for_percent(100.0, WARMEST) - 1000.0).abs() < 0.5);
         let gains = channel_gains(6500.0);
         assert!((gains[0] - 1.0).abs() < 1e-6 && (gains[1] - 1.0).abs() < 1e-6);
         let warm = channel_gains(3000.0);

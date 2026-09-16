@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use crate::blue_light;
 use cosmic::cosmic_config::{self, ConfigGet, ConfigSet};
 
 pub const CONFIG_VERSION: u64 = 1;
@@ -13,6 +14,12 @@ const NIGHT_STRENGTH_KEY: &str = "night_strength";
 const NIGHT_DIM_KEY: &str = "night_dim";
 const LATITUDE_KEY: &str = "latitude";
 const LONGITUDE_KEY: &str = "longitude";
+const WARMEST_TEMPERATURE_K_KEY: &str = "warmest_temperature_k";
+
+/// Below this, `blue_light::raw_gains`'s own domain has already saturated (its
+/// floor is 1000 K), so a colder hand-edit would silently do nothing extra.
+/// Treated as invalid, like an out-of-range latitude.
+const WARMEST_TEMPERATURE_FLOOR_K: f32 = 1000.0;
 
 /// Everything the applet persists.
 ///
@@ -37,6 +44,10 @@ pub struct Settings {
     pub latitude: f64,
     /// East-positive.
     pub longitude: f64,
+    /// The colour temperature "Warmth" reaches at 100%. No UI; hand-edit the
+    /// key to push it redder (or pull it back) than the shipped default. Read
+    /// at startup and never written back -- see `store`.
+    pub warmest_temperature_k: f32,
 }
 
 impl Default for Settings {
@@ -54,6 +65,7 @@ impl Default for Settings {
             // wrong -- the worst kind of default.
             latitude: 51.5074,
             longitude: -0.1278,
+            warmest_temperature_k: WARMEST_TEMPERATURE_FLOOR_K,
         }
     }
 }
@@ -105,6 +117,12 @@ impl Settings {
         }
         if !self.longitude.is_finite() || self.longitude.abs() > 180.0 {
             self.longitude = defaults.longitude;
+        }
+        if !self.warmest_temperature_k.is_finite()
+            || self.warmest_temperature_k < WARMEST_TEMPERATURE_FLOOR_K
+            || self.warmest_temperature_k >= blue_light::NEUTRAL_TEMPERATURE_K
+        {
+            self.warmest_temperature_k = defaults.warmest_temperature_k;
         }
         self
     }
@@ -176,6 +194,9 @@ impl Store {
             night_dim: handler.get(NIGHT_DIM_KEY).unwrap_or(defaults.night_dim),
             latitude: handler.get(LATITUDE_KEY).unwrap_or(defaults.latitude),
             longitude: handler.get(LONGITUDE_KEY).unwrap_or(defaults.longitude),
+            warmest_temperature_k: handler
+                .get(WARMEST_TEMPERATURE_K_KEY)
+                .unwrap_or(defaults.warmest_temperature_k),
         }
         .sanitised()
     }
@@ -195,16 +216,18 @@ impl Store {
         let _ = tx.set(DAY_DIM_KEY, settings.day_dim);
         let _ = tx.set(NIGHT_STRENGTH_KEY, settings.night_strength);
         let _ = tx.set(NIGHT_DIM_KEY, settings.night_dim);
-        // Latitude and longitude are deliberately absent. They have no UI and
-        // are meant to be edited by hand, so writing them back here would stamp
-        // on an edit made while the applet is running. `seed_location` puts
-        // them on disk once so there is something to find.
+        // Latitude, longitude, and warmest_temperature_k are deliberately
+        // absent. None of the three has a UI; they are meant to be edited by
+        // hand, so writing them back here would stamp on an edit made while
+        // the applet is running. `seed_hand_editable` puts them on disk once
+        // so there is something to find.
         let _ = tx.commit();
     }
 
-    /// Put the location keys on disk if they are not there, so a user has
-    /// something to edit. Never overwrites.
-    pub fn seed_location(&self, settings: Settings) {
+    /// Put the keys that have no UI on disk if they are not there yet, so a
+    /// user has something to edit: latitude, longitude, and
+    /// `warmest_temperature_k`. Never overwrites.
+    pub fn seed_hand_editable(&self, settings: Settings) {
         let Some(handler) = self.handler.as_ref() else {
             return;
         };
@@ -213,6 +236,9 @@ impl Store {
         }
         if handler.get::<f64>(LONGITUDE_KEY).is_err() {
             let _ = handler.set(LONGITUDE_KEY, settings.longitude);
+        }
+        if handler.get::<f32>(WARMEST_TEMPERATURE_K_KEY).is_err() {
+            let _ = handler.set(WARMEST_TEMPERATURE_K_KEY, settings.warmest_temperature_k);
         }
     }
 }
@@ -278,11 +304,16 @@ mod tests {
             longitude: 515.074,
             night_strength: f32::NAN,
             day_dim: -50.0,
+            warmest_temperature_k: 50_000.0,
             ..Settings::default()
         }
         .sanitised();
         assert!(broken.latitude.is_finite() && broken.longitude.abs() <= 180.0);
         assert!(broken.night_strength.is_finite() && broken.day_dim >= 0.0);
+        assert!(
+            broken.warmest_temperature_k.is_finite()
+                && broken.warmest_temperature_k < blue_light::NEUTRAL_TEMPERATURE_K
+        );
         let (strength, dim) = broken.effective(0.0);
         assert!(strength.is_finite() && dim.is_finite());
     }

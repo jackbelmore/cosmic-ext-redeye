@@ -62,6 +62,19 @@ Latitude is north-positive, longitude **east**-positive. They are read at startu
 restart the applet after changing them — the applet never writes them back, so an edit
 made while it is running will not be overwritten.
 
+The reddest the "Warmth" slider goes at 100% also has no UI. It defaults to 1000 K:
+
+```sh
+echo 1000 > ~/.config/cosmic/io.github.big-ol-pants.CosmicExtRedeye/v1/warmest_temperature_k
+```
+
+Lower is redder. Values are clamped to a sensible range -- at least 1000 K, below
+which the colour math has already saturated and going lower does nothing extra,
+and strictly below 6500 K, the neutral point the slider fades from, since anything
+at or above that flattens or inverts the slider. Like latitude and longitude, this
+is read at startup only and never written back, so restart the applet after
+changing it.
+
 Diagnostics go to the panel's journal, which inside COSMIC is the only place to see them:
 
 ```sh

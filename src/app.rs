@@ -86,8 +86,8 @@ impl cosmic::Application for App {
         let config = Store::new(Self::APP_ID);
         let settings = config.load();
 
-        // Put the location keys on disk so there is something to hand-edit.
-        config.seed_location(settings);
+        // Put the hand-editable keys on disk so there is something to edit.
+        config.seed_hand_editable(settings);
 
         let mut app = App {
             core,
@@ -250,7 +250,10 @@ impl cosmic::Application for App {
         } else {
             format!(
                 "Redeye - manual, {:.0} K",
-                blue_light::temperature_for_percent(self.settings.strength)
+                blue_light::temperature_for_percent(
+                    self.settings.strength,
+                    self.settings.warmest_temperature_k
+                )
             )
         };
 
@@ -307,7 +310,11 @@ impl App {
             return;
         }
 
-        let (status, shape) = match self.filter.set_strength(strength, dim) {
+        let (status, shape) = match self.filter.set_strength(
+            strength,
+            dim,
+            self.settings.warmest_temperature_k,
+        ) {
             Ok(status) => {
                 self.applied = Some((strength, dim));
                 let shape = match status {
@@ -349,12 +356,20 @@ impl App {
 
         let day = widget::settings::section()
             .title("Day")
-            .add(warmth_slider(Period::Day, settings.day_strength))
+            .add(warmth_slider(
+                Period::Day,
+                settings.day_strength,
+                settings.warmest_temperature_k,
+            ))
             .add(dim_slider(Period::Day, settings.day_dim));
 
         let night = widget::settings::section()
             .title("Night")
-            .add(warmth_slider(Period::Night, settings.night_strength))
+            .add(warmth_slider(
+                Period::Night,
+                settings.night_strength,
+                settings.warmest_temperature_k,
+            ))
             .add(dim_slider(Period::Night, settings.night_dim));
 
         // What is on screen right now, which only matches a slider when the
@@ -362,14 +377,14 @@ impl App {
         let now = if settings.auto {
             format!(
                 "Now {:.0} K, -{:.0}%   sun {:+.1}\u{00b0}",
-                blue_light::temperature_for_percent(strength),
+                blue_light::temperature_for_percent(strength, settings.warmest_temperature_k),
                 dim,
                 self.elevation
             )
         } else {
             format!(
                 "Manual {:.0} K, -{:.0}%",
-                blue_light::temperature_for_percent(strength),
+                blue_light::temperature_for_percent(strength, settings.warmest_temperature_k),
                 dim
             )
         };
@@ -410,8 +425,8 @@ fn labelled_slider(
         .into()
 }
 
-fn warmth_slider(period: Period, value: f32) -> Element<'static, Message> {
-    let kelvin = blue_light::temperature_for_percent(value);
+fn warmth_slider(period: Period, value: f32, warmest_temperature_k: f32) -> Element<'static, Message> {
+    let kelvin = blue_light::temperature_for_percent(value, warmest_temperature_k);
     labelled_slider("Warmth", format!("{kelvin:.0} K"), 0.0..=100.0, value, move |v| {
         Message::StrengthChanged(period, v)
     })
