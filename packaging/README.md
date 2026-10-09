@@ -4,9 +4,9 @@ redeye drives a real per-channel gamma ramp over
 `zwlr_gamma_control_unstable_v1`. Stock Fedora `cosmic-comp` does not
 advertise that protocol, so it has to run a patched compositor.
 
-The full tree is the private fork `jackbelmore/cosmic-comp`. One branch per
-upstream release, each being the upstream `epoch-X.Y.Z` tag plus a single
-commit (rebased from [pop-os/cosmic-comp#2417](https://github.com/pop-os/cosmic-comp/pull/2417)):
+The full tree is the fork [jackbelmore/cosmic-comp](https://github.com/jackbelmore/cosmic-comp).
+One branch per upstream release, each being the upstream `epoch-X.Y.Z` tag plus a single
+commit: Nick Smith's [pop-os/cosmic-comp#2417](https://github.com/pop-os/cosmic-comp/pull/2417), rebased.
 
 | Branch | Base | Patch here |
 |---|---|---|
@@ -25,7 +25,7 @@ session started with (`/usr/local/bin` ahead of `/usr/bin`), so a symlink in
 `/usr/local/bin` wins and leaves the distro package untouched.
 
 ```sh
-git clone git@github.com:jackbelmore/cosmic-comp.git && cd cosmic-comp
+git clone https://github.com/jackbelmore/cosmic-comp.git && cd cosmic-comp
 git checkout gamma-1.9.0
 cargo build --release                      # ~6 min, toolchain pinned by rust-toolchain.toml
 mkdir -p ~/.local/opt/cosmic-comp-fork

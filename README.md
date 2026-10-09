@@ -1,140 +1,129 @@
-# Cosmic Ext Redeye
+# Redeye
 
-A night light applet for the COSMIC desktop, driving a real per-channel gamma ramp.
+A night light for the [COSMIC](https://system76.com/cosmic) desktop that warms your screen
+without washing out the blacks.
 
-Warmth and dimming are applied as `out = screen * gain` through
-`zwlr_gamma_control_unstable_v1`, so **black stays black**. An earlier version of this
-applet tinted with a layer-shell overlay; that can only ever do
-`out = tint + (1 - alpha) * screen`, where the slope is one scalar shared by all three
-channels, so it could introduce colour only by lifting blacks. That is the washed-out
-haze, and it is why the backend was replaced rather than tuned.
+![Rust](https://img.shields.io/badge/Rust-applet-b7410e?logo=rust)
+![COSMIC](https://img.shields.io/badge/COSMIC-1.9-48b9c7)
+![License](https://img.shields.io/badge/license-MPL--2.0-blue)
+
+## Why
+
+COSMIC doesn't ship a night light. The original Redeye faked one by putting a translucent
+orange layer over the whole screen. That can only *add* colour, so black turns into a
+brownish haze and dark themes look washed out.
+
+Changing the display's gamma ramp fixes this, because it *multiplies* each colour channel
+instead:
+
+|                     | Overlay (old)                  | Gamma ramp (now)       |
+| ------------------- | ------------------------------ | ---------------------- |
+| Maths               | `out = tint + (1 − α) · screen` | `out = gain · screen` |
+| Black               | lifted into a haze             | stays at exactly 0     |
+| Per-channel control | no, one slope for all three    | yes                    |
+
+The catch is that COSMIC's compositor doesn't support the Wayland protocol for this
+(`wlr-gamma-control`), and upstream has turned it down twice. So the project has two halves:
+
+- **this applet**, rewritten to drive real gamma ramps
+- **[a patched cosmic-comp](https://github.com/jackbelmore/cosmic-comp)** that adds the
+  protocol, based on Nick Smith's upstream PR
 
 ## Features
 
-- Day and night presets, fading smoothly as the sun crosses from +3° to −6° — about an
-  hour, longer near the solstices. The window matches gammastep and redshift.
-- Dragging any slider drops out of the schedule and applies the pair you are dragging, so
-  you can see a night setting at midday instead of adjusting it blind. The **Follow the
-  sun** toggle puts it back, resuming wherever the sun currently is (expect a jump if you
-  do that at midnight — that is the schedule, not a glitch).
-- Scroll the panel icon to nudge warmth without opening the popup. Like a drag, this takes
-  over from the schedule; the tooltip tells you which mode you are in.
+- Separate **day and night** settings that fade into each other as the sun sets and rises
+  (+3° to −6° elevation, the same window gammastep and redshift use)
+- **Warmth** down to 1000 K, plus a **dim** slider
+- Move any slider to preview it straight away. **Follow the sun** puts the schedule back
+- **Scroll** over the panel icon to nudge the warmth
+- Copes with monitors being plugged in and out, and hands the ramp back on exit, so the
+  screen is never left tinted
 
-## Requirements
+## Install
 
-**This applet needs a compositor that implements `zwlr_gamma_control_manager_v1`.** Stock
-`cosmic-comp` does not. Upstream has declined the protocol twice, deferring it to a wider
-colour-management story, so this is not a matter of waiting for a release.
+### 1. The patched compositor
 
-Check with:
+Use the branch that matches your COSMIC version (`rpm -q cosmic-session`). On Fedora:
 
 ```sh
-wayland-info | grep zwlr_gamma_control_manager_v1
+sudo dnf install libseat-devel libinput-devel
+git clone -b gamma-1.9.0 https://github.com/jackbelmore/cosmic-comp.git
+cd cosmic-comp && cargo build --release
+mkdir -p ~/.local/opt/cosmic-comp-fork
+cp target/release/cosmic-comp ~/.local/opt/cosmic-comp-fork/cosmic-comp-fork
+sudo ln -s ~/.local/opt/cosmic-comp-fork/cosmic-comp-fork /usr/local/bin/cosmic-comp
 ```
 
-If it is absent the applet will say so in its popup and do nothing else. Getting it
-present means running a patched `cosmic-comp` carrying
-[PR #2417](https://github.com/pop-os/cosmic-comp/pull/2417). If you build one, pin it, or
-the next distro upgrade will silently replace it and the applet will go inert:
+Log out and back in. Your distro's `cosmic-comp` is left alone, so undoing it is just
+`sudo rm /usr/local/bin/cosmic-comp` and logging in again. More detail, including what to
+do after a COSMIC update, is in [packaging/](./packaging/README.md).
+
+### 2. The applet
 
 ```sh
-# /etc/dnf/dnf.conf, under [main]
-excludepkgs=cosmic-comp
+git clone https://github.com/jackbelmore/cosmic-ext-redeye.git
+cd cosmic-ext-redeye && just install-user
 ```
 
-Gamma control is **exclusive per output**, so gammastep, wlsunset or redshift cannot run
-alongside this. Whichever binds second is refused — gammastep words that refusal
-misleadingly as "Zero outputs support gamma adjustment".
+Then add **Cosmic Ext Redeye** to your panel in COSMIC Settings.
+
+Gamma control belongs to one app at a time, so stop gammastep, wlsunset or redshift first.
 
 ## Configuration
 
-Slider positions and presets are stored per key under
-`~/.config/cosmic/io.github.big-ol-pants.CosmicExtRedeye/v1/`.
-
-Location has no UI. Set it by editing two files there, which default to London:
+The schedule needs your location. There's no UI for it yet and it defaults to London:
 
 ```sh
-echo 51.5074 > ~/.config/cosmic/io.github.big-ol-pants.CosmicExtRedeye/v1/latitude
-echo -- -0.1278 > ~/.config/cosmic/io.github.big-ol-pants.CosmicExtRedeye/v1/longitude
+cd ~/.config/cosmic/io.github.big-ol-pants.CosmicExtRedeye/v1
+echo 51.5074 > latitude     # north is positive
+echo -0.1278 > longitude    # east is positive
+echo 1000 > warmest_temperature_k   # how red 100% warmth goes (1000–6499 K)
 ```
 
-Latitude is north-positive, longitude **east**-positive. They are read at startup only, so
-restart the applet after changing them — the applet never writes them back, so an edit
-made while it is running will not be overwritten.
-
-The reddest the "Warmth" slider goes at 100% also has no UI. It defaults to 1000 K:
-
-```sh
-echo 1000 > ~/.config/cosmic/io.github.big-ol-pants.CosmicExtRedeye/v1/warmest_temperature_k
-```
-
-Lower is redder. Values are clamped to a sensible range -- at least 1000 K, below
-which the colour math has already saturated and going lower does nothing extra,
-and strictly below 6500 K, the neutral point the slider fades from, since anything
-at or above that flattens or inverts the slider. Like latitude and longitude, this
-is read at startup only and never written back, so restart the applet after
-changing it.
-
-Diagnostics go to the panel's journal, which inside COSMIC is the only place to see them:
+These are read at startup, so restart the applet after changing them. If something isn't
+working, the applet logs to the journal:
 
 ```sh
 journalctl --user -f | grep redeye:
 ```
 
-## Installation
+## How I built this
 
-A [justfile](./justfile) is included by default for the [casey/just][just] command runner.
+I use COSMIC every day and wanted a proper night light. I started from big-ol-pants'
+Redeye and tried to make its colours better with a per-channel colour temperature fit.
+That's when I worked out why an overlay could never look right: all three channels share
+one slope, so the only way to add warmth is to lift the blacks.
 
-- `just` builds the application with the default `just build-release` recipe
-- `just run` builds and runs the application
-- `just install` installs the project into the system
-- `just install-user` installs the applet into `~/.local` for current-user testing
-- `just vendor` creates a vendored tarball
-- `just build-vendored` compiles with vendored dependencies from that tarball
-- `just check` runs clippy on the project to check for linter warnings
-- `just check-json` can be used by IDEs that support LSP
+That meant gamma ramps, which meant a compositor that supported them. I found Nick Smith's
+closed PR adding the protocol to cosmic-comp, rebased it onto the current COSMIC release,
+and run it as my compositor. Then I rewrote the applet around it.
 
-## COSMIC Panel
+I built it with [Claude Code](https://claude.com/claude-code) as a pair programmer. I
+decided what it should do and how, reviewed the changes, and insisted on checking things
+on real hardware rather than trusting that they worked:
 
-Running the binary directly starts the applet surface as a small transparent window. For panel
-placement, install the desktop entry and launch it through COSMIC Panel:
+- Reading the GPU's gamma table back from the kernel to confirm black really is
+  `(0, 0, 0)` and the gains match the maths
+- Testing the sun-position code against gammastep at five locations, including Auckland,
+  Anchorage and Tromsø, to catch longitude and hemisphere sign mistakes
+- Catching a bug where a `NaN` would have turned the screen fully black, with no UI left
+  to undo it
+- 14 unit tests (`cargo test`)
 
-```sh
-just install-user
-```
+The commits are co-authored with Claude, so the history shows how it was made.
 
-Then add `io.github.big-ol-pants.CosmicExtRedeye` to the upper-right panel plugin list through COSMIC
-Settings, or by editing the second list in:
+## Credits
 
-```sh
-~/.config/cosmic/com.system76.CosmicPanel.Panel/v1/plugins_wings
-```
+- [big-ol-pants](https://github.com/big-ol-pants) for the original Redeye applet
+- [Nick Smith](https://github.com/nicholaspsmith) for `wlr-gamma-control` in cosmic-comp
+  ([pop-os/cosmic-comp#2417](https://github.com/pop-os/cosmic-comp/pull/2417))
+- [Luna Jernberg](https://github.com/bittin) for the Swedish translation
+- Colour temperature from Tanner Helland's approximation, sun position from NOAA's
+  algorithm (Meeus)
 
-## Translators
+Translations live in [i18n/](./i18n) as [Fluent](https://projectfluent.org/) files. Copy
+`en` to your language code to add one.
 
-[Fluent][fluent] is used for localization of the software. Fluent's translation files are found in the [i18n directory](./i18n). New translations may copy the [English (en) localization](./i18n/en) of the project, rename `en` to the desired [ISO 639-1 language code][iso-codes], and then translations can be provided for each [message identifier][fluent-guide]. If no translation is necessary, the message may be omitted.
+## License
 
-## Packaging
-
-If packaging for a Linux distribution, vendor dependencies locally with the `vendor` rule, and build with the vendored sources using the `build-vendored` rule. When installing files, use the `rootdir` and `prefix` variables to change installation paths.
-
-```sh
-just vendor
-just build-vendored
-just rootdir=debian/cosmic-ext-redeye prefix=/usr install
-```
-
-It is recommended to build a source tarball with the vendored dependencies, which can typically be done by running `just vendor` on the host system before it enters the build environment.
-
-## Developers
-
-Developers should install [rustup][rustup] and configure their editor to use [rust-analyzer][rust-analyzer]. To improve compilation times, disable LTO in the release profile, install the [mold][mold] linker, and configure [sccache][sccache] for use with Rust. The [mold][mold] linker will only improve link times if LTO is disabled.
-
-[fluent]: https://projectfluent.org/
-[fluent-guide]: https://projectfluent.org/fluent/guide/hello.html
-[iso-codes]: https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes
-[just]: https://github.com/casey/just
-[rustup]: https://rustup.rs/
-[rust-analyzer]: https://rust-analyzer.github.io/
-[mold]: https://github.com/rui314/mold
-[sccache]: https://github.com/mozilla/sccache
+The applet is [MPL-2.0](./LICENSE). The cosmic-comp fork is GPL-3.0, like upstream.
