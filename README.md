@@ -23,7 +23,9 @@ instead:
 | Per-channel control | no, one slope for all three    | yes                    |
 
 The catch is that COSMIC's compositor doesn't support the Wayland protocol for this
-(`wlr-gamma-control`), and upstream has turned it down twice. So the project has two halves:
+(`wlr-gamma-control`). The COSMIC team plans a built-in night light as part of their
+colour management work in Epoch 3, and won't take the protocol before then. So the project
+has two halves:
 
 - **this applet**, rewritten to drive real gamma ramps
 - **[a patched cosmic-comp](https://github.com/jackbelmore/cosmic-comp)** that adds the
@@ -68,6 +70,24 @@ cd cosmic-ext-redeye && just install-user
 Then add **Cosmic Ext Redeye** to your panel in COSMIC Settings.
 
 Gamma control belongs to one app at a time, so stop gammastep, wlsunset or redshift first.
+
+## Alternatives
+
+Running a patched compositor isn't for everyone. If you'd rather not,
+[cosmic-nightlight](https://github.com/cosmic-nightlight/cosmic-nightlight) works on stock
+COSMIC and is much easier to install. It also uses real gamma, so blacks stay black. It
+gets there by briefly switching to another virtual terminal to write the gamma table, so:
+
+|                                  | Redeye                    | cosmic-nightlight            |
+| -------------------------------- | ------------------------- | ---------------------------- |
+| Stock COSMIC                     | no, needs patched compositor | yes (.deb / flatpak)      |
+| Changing the tint                | instant, smooth fades     | 1–2 s flicker each change    |
+| Monitor plugged in, screen wakes | re-applied automatically  | can clear the tint           |
+| Needs root                       | no                        | a small helper, via polkit   |
+| Schedule                         | sun position from your location | time zone or custom times |
+| gammastep, wlsunset etc.         | also work with the patched compositor | no          |
+
+Once COSMIC ships its own night light, both of these become stopgaps.
 
 ## Configuration
 
@@ -116,7 +136,9 @@ The commits are co-authored with Claude, so the history shows how it was made.
 
 - [big-ol-pants](https://github.com/big-ol-pants) for the original Redeye applet
 - [Nick Smith](https://github.com/nicholaspsmith) for `wlr-gamma-control` in cosmic-comp
-  ([pop-os/cosmic-comp#2417](https://github.com/pop-os/cosmic-comp/pull/2417))
+  ([pop-os/cosmic-comp#2417](https://github.com/pop-os/cosmic-comp/pull/2417)), ported from
+  [niri](https://github.com/niri-wm/niri)'s implementation by
+  [phuhl](https://github.com/phuhl) and [YaLTeR](https://github.com/YaLTeR)
 - [Luna Jernberg](https://github.com/bittin) for the Swedish translation
 - Colour temperature from Tanner Helland's approximation, sun position from NOAA's
   algorithm (Meeus)
