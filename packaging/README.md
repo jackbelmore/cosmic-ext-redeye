@@ -1,67 +1,54 @@
-# Patched `cosmic-comp`
+# Modified cosmic-comp
 
-redeye drives a real per-channel gamma ramp over
-`zwlr_gamma_control_unstable_v1`. Stock Fedora `cosmic-comp` does not
-advertise that protocol, so it has to run a patched compositor.
+Redeye needs a cosmic-comp that supports `wlr-gamma-control`. The fork
+[jackbelmore/cosmic-comp](https://github.com/jackbelmore/cosmic-comp) has one branch per
+COSMIC release: the upstream `epoch-X.Y.Z` tag plus one commit, Nick Smith's
+[#2417](https://github.com/pop-os/cosmic-comp/pull/2417).
 
-The full tree is the fork [jackbelmore/cosmic-comp](https://github.com/jackbelmore/cosmic-comp).
-One branch per upstream release, each being the upstream `epoch-X.Y.Z` tag plus a single
-commit: Nick Smith's [pop-os/cosmic-comp#2417](https://github.com/pop-os/cosmic-comp/pull/2417), rebased.
+| Branch                  | Same change as a patch  |
+| ----------------------- | ----------------------- |
+| `gamma-1.10.0` (latest) | `gamma-on-1.10.0.patch` |
+| `gamma-1.9.0`           | `gamma-on-1.9.0.patch`  |
+| `gamma-1.8.0`           | `gamma-on-1.8.0.patch`  |
 
-| Branch | Base | Patch here |
-|---|---|---|
-| `gamma-1.9.0` (current) | `epoch-1.9.0` | `gamma-on-1.9.0.patch` |
-| `gamma-1.8.0` | `epoch-1.8.0` | `gamma-on-1.8.0.patch` |
+Use the branch that matches `rpm -q cosmic-session`. A mismatch can stop you logging in.
 
-Each patch is `git diff epoch-X.Y.Z..gamma-X.Y.Z` from the fork. Keep the
-compositor on the same version as the installed `cosmic-session`
-(`rpm -q cosmic-session`); a mismatch risks "incompatible cosmic-session and
-cosmic-comp versions" and a session that drops back to the greeter.
-
-## Current setup: local build + `/usr/local/bin` symlink
-
-No RPM. `cosmic-session` launches plain `cosmic-comp` using the PATH the
-session started with (`/usr/local/bin` ahead of `/usr/bin`), so a symlink in
-`/usr/local/bin` wins and leaves the distro package untouched.
+## Install
 
 ```sh
-git clone https://github.com/jackbelmore/cosmic-comp.git && cd cosmic-comp
-git checkout gamma-1.9.0
-cargo build --release                      # ~6 min, toolchain pinned by rust-toolchain.toml
+sudo dnf install libseat-devel libinput-devel
+git clone -b gamma-1.10.0 https://github.com/jackbelmore/cosmic-comp.git
+cd cosmic-comp && cargo build --release      # about 6 minutes
 mkdir -p ~/.local/opt/cosmic-comp-fork
 cp target/release/cosmic-comp ~/.local/opt/cosmic-comp-fork/cosmic-comp-fork
 sudo ln -s ~/.local/opt/cosmic-comp-fork/cosmic-comp-fork /usr/local/bin/cosmic-comp
-# then log out and back in
 ```
 
-Build deps beyond the usual: `libseat-devel libinput-devel`.
+Log out and back in. COSMIC finds `cosmic-comp` through your PATH, where `/usr/local/bin`
+comes before `/usr/bin`, so your distro's version is never touched.
 
-Build the compositor and the applet one after the other, not together: both
-are memory-hungry on a 16 GB machine.
+To undo it, run `sudo rm /usr/local/bin/cosmic-comp` and log in again. If the desktop
+won't load, press Ctrl+Alt+F3 and run it from there.
 
-**Revert:** `sudo rm /usr/local/bin/cosmic-comp`, then log in again. If the
-session will not start, Ctrl+Alt+F3, log in on the TTY, run the same command.
+## After a COSMIC update
 
-### After a Fedora update of `cosmic-comp` / `cosmic-session`
-
-The symlink keeps pointing at the old build, so the running compositor falls
-behind the session. Rebase the fork onto the new tag and rebuild:
+Rebuild **before** you log out, or you'll log in to an old cosmic-comp with a newer COSMIC.
 
 ```sh
+git remote add upstream https://github.com/pop-os/cosmic-comp.git   # first time only
 git fetch upstream --tags
 git checkout -b gamma-X.Y.Z epoch-X.Y.Z
-git cherry-pick <gamma commit from the previous branch>
-cargo build --release && cp target/release/cosmic-comp ~/.local/opt/cosmic-comp-fork/cosmic-comp-fork
+git cherry-pick <the gamma commit from the previous branch>
+cargo build --release
+cp target/release/cosmic-comp ~/.local/opt/cosmic-comp-fork/new
+mv ~/.local/opt/cosmic-comp-fork/new ~/.local/opt/cosmic-comp-fork/cosmic-comp-fork
 ```
 
-## Older route: patched RPM (1.8.0)
+The copy-then-rename matters: copying straight over the running file fails with
+"Text file busy".
 
-`cosmic-comp.spec`, `gamma-on-1.8.0.patch` and `vendor-config-1.8.0.toml` are
-the pieces of the patched-RPM build used on 1.8.0. They are kept for
-reference and are not used by the current setup.
+## Old RPM build
 
-- `Release: 1.gamma1`, so `rpm -q cosmic-comp` shows whether the patched build is live.
-- `debug_package %{nil}`, `debuginfo=0`, `codegen-units=16`: rustc was
-  OOM-killed linking with `debuginfo=2` (10.1 GB anon-rss on a 15 GB box).
-- Install with `sudo rpm -Uvh --force`, not `dnf`, with `excludepkgs=cosmic-comp`
-  in `/etc/dnf/dnf.conf` so an update cannot replace it.
+`cosmic-comp.spec` and `vendor-config-1.8.0.toml` are from an earlier patched RPM of 1.8.0,
+kept for reference. It turned off debug info, because linking with it ran out of memory on
+16 GB of RAM.
