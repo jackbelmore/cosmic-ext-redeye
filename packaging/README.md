@@ -2,8 +2,9 @@
 
 Redeye needs a cosmic-comp that supports `wlr-gamma-control`. The fork
 [jackbelmore/cosmic-comp](https://github.com/jackbelmore/cosmic-comp) has one branch per
-COSMIC release: the upstream `epoch-X.Y.Z` tag plus one commit, Nick Smith's
-[#2417](https://github.com/pop-os/cosmic-comp/pull/2417).
+COSMIC release: the upstream `epoch-X.Y.Z` tag plus Nick Smith's
+[#2417](https://github.com/pop-os/cosmic-comp/pull/2417). The latest branch also has a short
+README note on top.
 
 | Branch                  | Same change as a patch  |
 | ----------------------- | ----------------------- |
@@ -38,7 +39,7 @@ Rebuild **before** you log out, or you'll log in to an old cosmic-comp with a ne
 git remote add upstream https://github.com/pop-os/cosmic-comp.git   # first time only
 git fetch upstream --tags
 git checkout -b gamma-X.Y.Z epoch-X.Y.Z
-git cherry-pick <the gamma commit from the previous branch>
+git cherry-pick epoch-A.B.C..gamma-A.B.C   # A.B.C = the previous branch
 cargo build --release
 cp target/release/cosmic-comp ~/.local/opt/cosmic-comp-fork/new
 mv ~/.local/opt/cosmic-comp-fork/new ~/.local/opt/cosmic-comp-fork/cosmic-comp-fork

@@ -3,6 +3,8 @@
 A night light for the [COSMIC](https://system76.com/cosmic) desktop. It makes your screen
 warmer at night without turning blacks grey.
 
+Started as a fork of [big-ol-pants/cosmic-ext-redeye](https://github.com/big-ol-pants/cosmic-ext-redeye).
+
 ![Rust](https://img.shields.io/badge/Rust-applet-b7410e?logo=rust)
 ![COSMIC](https://img.shields.io/badge/COSMIC-1.10-48b9c7)
 ![License](https://img.shields.io/badge/license-MPL--2.0-blue)
