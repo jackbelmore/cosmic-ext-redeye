@@ -9,6 +9,17 @@ Started as a fork of [big-ol-pants/cosmic-ext-redeye](https://github.com/big-ol-
 ![COSMIC](https://img.shields.io/badge/COSMIC-1.10-48b9c7)
 ![License](https://img.shields.io/badge/license-MPL--2.0-blue)
 
+<table>
+<tr>
+<th>Original</th>
+<th>Redeye now</th>
+</tr>
+<tr>
+<td valign="top"><img src="docs/screenshots/original.png" width="300" alt="The original applet: a single blue filter slider"></td>
+<td valign="top"><img src="docs/screenshots/redeye.png" width="300" alt="Redeye now: a Follow the sun switch, and warmth and dim sliders for day and night"></td>
+</tr>
+</table>
+
 ## Why
 
 COSMIC doesn't have a night light yet. Most workarounds lay a see-through orange layer over
